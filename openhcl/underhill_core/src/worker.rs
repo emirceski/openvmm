@@ -1637,7 +1637,10 @@ async fn new_underhill_vm(
     let uevent_listener =
         Arc::new(UeventListener::new(tp.driver(0)).context("failed to start uevent listener")?);
 
-    let use_mmio_hypercalls = dps.general.always_relay_host_mmio;
+    // Under VBS the guest can't touch host device MMIO directly, so route it
+    // through the paravisor via hypercalls (hardware-isolated handled below).
+    let use_mmio_hypercalls =
+        dps.general.always_relay_host_mmio || matches!(isolation, virt::IsolationType::Vbs);
     // TODO: Centralize cpuid based feature determination.
     #[cfg(guest_arch = "x86_64")]
     let use_mmio_hypercalls = use_mmio_hypercalls
@@ -3326,6 +3329,22 @@ async fn new_underhill_vm(
             if enable_vpci_relay {
                 use vpci_relay::*;
 
+                // Under VBS the relay must accept an assigned device's BAR MMIO
+                // (on MMIO-enable) before the lower VTL can access it.
+                let mmio_accept: Option<Arc<dyn AcceptDeviceMmio>> =
+                    if matches!(isolation, virt::IsolationType::Vbs) {
+                        let mshv_hvcall = hcl::ioctl::MshvHvcall::new()
+                            .context("failed to open mshv_hvcall device for MMIO acceptance")?;
+                        // HvCallAcceptGpaPages to accept the BAR ranges.
+                        mshv_hvcall
+                            .set_allowed_hypercalls(&[hvdef::HypercallCode::HvCallAcceptGpaPages]);
+                        Some(Arc::new(DeviceMmioAcceptor {
+                            mshv_hvcall: Arc::new(mshv_hvcall),
+                        }))
+                    } else {
+                        None
+                    };
+
                 let mut relay = VpciRelay::new(
                     driver_source.clone(),
                     vpci_filter.take(),
@@ -3333,7 +3352,9 @@ async fn new_underhill_vm(
                     dma_manager.new_client(DmaClientParameters {
                         device_name: "vpci-relay".into(),
                         lower_vtl_policy: LowerVtlPermissionPolicy::Vtl0,
-                        allocation_visibility: if hardware_isolated {
+                        // Relay ring buffer must be host-visible (shared pool);
+                        // under any isolation private memory fails open (0x8000ffff).
+                        allocation_visibility: if isolation.is_isolated() {
                             AllocationVisibility::Shared
                         } else {
                             AllocationVisibility::Private
@@ -3353,6 +3374,7 @@ async fn new_underhill_vm(
                         )
                     },
                     vtom,
+                    mmio_accept,
                     VpciRelayOptions {
                         // Exercises a mocked TDISP flow for emulated TDISP devices produced by OpenVMM tests.
                         test_tdisp_flow: matches!(
@@ -3396,6 +3418,21 @@ async fn new_underhill_vm(
                     prog_if: Some(ProgrammingInterface::NONE),
                     sub_class: Some(Subclass::NONE),
                     base_class: Some(ClassCode::ENCRYPTION_CONTROLLER),
+                    sub_vendor_id: None,
+                    sub_system_id: None,
+                });
+
+                // Allow NVIDIA GPUs. Match any NVIDIA display controller
+                // (covers both VGA and 3D-controller subclasses) regardless of
+                // the specific device ID, since the assigned VF's device ID
+                // varies by GPU model.
+                relay.add_allowed_device(AllowedDevice {
+                    vendor_id: Some(0x10de), // NVIDIA vendor ID
+                    device_id: None,
+                    revision_id: None,
+                    prog_if: None,
+                    sub_class: None,
+                    base_class: Some(ClassCode::DISPLAY_CONTROLLER),
                     sub_vendor_id: None,
                     sub_system_id: None,
                 });
@@ -3616,7 +3653,13 @@ async fn new_underhill_vm(
                 .new_client(DmaClientParameters {
                     device_name: "shutdown-relay".into(),
                     lower_vtl_policy: LowerVtlPermissionPolicy::Vtl0,
-                    allocation_visibility: AllocationVisibility::Private,
+                    // Shutdown IC ring buffer must be host-visible (shared pool);
+                    // under any isolation private memory fails open (0x8000ffff).
+                    allocation_visibility: if isolation.is_isolated() {
+                        AllocationVisibility::Shared
+                    } else {
+                        AllocationVisibility::Private
+                    },
                     persistent_allocations: false,
                 })
                 .context("shutdown relay dma client")?,
@@ -4061,9 +4104,76 @@ async fn load_firmware(
     Ok(())
 }
 
-// Represents a stub MMIO device that handles unhandled MMIO accesses by
-// forwarding them to the host. It needs to implement the ChipsetDevice and
-// MmioIntercept traits.
+/// Accepts an assigned device's BAR MMIO into the lower VTL under VBS. The
+/// accept runs synchronously on the config-write thread before the guest can
+/// touch the BAR, otherwise a racing guest MMIO fault deadlocks the host accept.
+struct DeviceMmioAcceptor {
+    mshv_hvcall: Arc<hcl::ioctl::MshvHvcall>,
+}
+
+impl vpci_relay::AcceptDeviceMmio for DeviceMmioAcceptor {
+    fn accept_device_mmio(&self, bars: Vec<(u64, u64)>) {
+        // Accept synchronously, one BAR at a time, before returning to the guest
+        // (prevents the host deadlock). Retries cover the brief pre-map window; a
+        // mappable BAR accepts on attempt 1, so keep it small (BAR0 never accepts).
+        const MAX_ATTEMPTS: u32 = 5;
+        const RETRY_DELAY: Duration = Duration::from_millis(20);
+
+        for (gpa, len) in bars {
+            if len == 0 {
+                continue;
+            }
+            let range = MemoryRange::bounding(gpa..gpa + len);
+            tracing::info!(CVM_ALLOWED, gpa, len, "accepting device BAR MMIO");
+            let mut attempt: u32 = 0;
+            loop {
+                attempt += 1;
+                match self
+                    .mshv_hvcall
+                    // NEEDED: device BAR MMIO must be accepted SHARED; PRIVATE
+                    // was tested and fails (guest can't read BARs -> Code 43).
+                    .accept_gpa_pages(
+                        range,
+                        hvdef::hypercall::AcceptMemoryType::ANY,
+                        hvdef::hypercall::HostVisibilityType::SHARED,
+                    ) {
+                    Ok(()) => {
+                        tracing::info!(
+                            CVM_ALLOWED,
+                            gpa,
+                            len,
+                            attempt,
+                            "accepted assigned device BAR MMIO"
+                        );
+                        break;
+                    }
+                    // Retryable: the accept can race ahead of the host's async
+                    // BAR map (not-yet-present fails with OperationDenied).
+                    Err(hcl::ioctl::AcceptPagesError::Hypervisor { hv_error, .. })
+                        if hv_error == hvdef::HvError::OperationDenied
+                            && attempt < MAX_ATTEMPTS =>
+                    {
+                        std::thread::sleep(RETRY_DELAY);
+                        continue;
+                    }
+                    Err(err) => {
+                        tracelimit::error_ratelimited!(
+                            CVM_ALLOWED,
+                            gpa,
+                            len,
+                            attempt,
+                            error = &err as &dyn std::error::Error,
+                            "failed to accept assigned device BAR MMIO"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Stub MMIO device that forwards unhandled MMIO accesses to the host.
 struct FallbackMmioDevice {
     mmio_ranges: Option<Vec<MemoryRange>>,
     mshv_hvcall: hcl::ioctl::MshvHvcall,

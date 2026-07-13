@@ -39,6 +39,7 @@ use openhcl_tdisp::TdispVirtualDeviceInterface;
 use pal_async::task::Spawn;
 use pal_async::task::Task;
 use parking_lot::Mutex;
+use pci_core::bar_mapping::BarMappings;
 use pci_core::spec::cfg_space::Command;
 use pci_core::spec::cfg_space::HeaderType00;
 use pci_core::spec::hwid::HardwareIds;
@@ -192,6 +193,15 @@ pub trait MemoryAccess: Send {
 /// The amount of MMIO space required by the VPCI bus.
 pub const MMIO_SIZE: u64 = 0x2000;
 
+/// Accepts a device's BAR MMIO into the lower VTL (required under VBS, where the
+/// aperture is inaccessible until accepted). `None` = not accepted here.
+pub trait AcceptDeviceMmio: Send + Sync {
+    /// Accept the BAR apertures (`(gpa, len)` pairs) synchronously before
+    /// returning to the guest, one at a time, so no guest MMIO races the accept
+    /// (which would deadlock the host).
+    fn accept_device_mmio(&self, bars: Vec<(u64, u64)>);
+}
+
 /// A device description, which represents a VPCI device available on a bus.
 #[derive(Inspect)]
 pub struct VpciDeviceDescription {
@@ -225,6 +235,8 @@ pub struct VpciDevice {
     #[inspect(hex, iter_by_index)]
     /// RAO == Read As One
     bar_rao: [u32; 6],
+    #[inspect(skip)]
+    mmio_accept: Option<Arc<dyn AcceptDeviceMmio>>,
 }
 
 #[derive(Inspect)]
@@ -338,7 +350,13 @@ impl VpciDeviceDescription {
     /// Initializes the device, returning a VPCI device instance that can be
     /// used to interact with it. Also returns an object to use to get notified
     /// when the device is ejected or surprise removed.
-    pub async fn init(self) -> anyhow::Result<(VpciDevice, VpciDeviceEject)> {
+    ///
+    /// `mmio_accept`, when provided, accepts the device's BAR MMIO into the
+    /// lower VTL on MMIO-enable (required under VBS).
+    pub async fn init(
+        self,
+        mmio_accept: Option<Arc<dyn AcceptDeviceMmio>>,
+    ) -> anyhow::Result<(VpciDevice, VpciDeviceEject)> {
         let requirements = self
             .req
             .call_failable(WorkerRequest::QueryResourceRequirements, self.id)
@@ -393,6 +411,7 @@ impl VpciDeviceDescription {
             numa_node,
             serial_num,
             dev,
+            mmio_accept,
         };
 
         Ok((device, VpciDeviceEject(eject)))
@@ -476,37 +495,68 @@ impl VpciDevice {
     /// Writes device configuration space.
     pub fn write_cfg(&self, offset: u16, value: u32) {
         tracing::trace!(?offset, value, "config space write");
-        let mut shadows = self.shadows.lock();
-        let shadows = &mut *shadows;
-        let mut accessor = self.config_space.lock();
-        match HeaderType00(offset) {
-            HeaderType00::STATUS_COMMAND => {
-                let new_command = Command::from(value as u16);
-                if new_command.mmio_enabled() && !shadows.command.mmio_enabled() {
-                    // Flush the BAR shadow to the device.
-                    for (i, &bar) in shadows.bars.iter().enumerate() {
-                        let bar_offset = HeaderType00::BAR0.0 + (i as u16 * 4);
-                        accessor.write(self.dev.id, bar_offset, bar);
+        // Collect the BAR ranges to accept (on MMIO-enable) while holding the
+        // config locks; the accept runs after they are dropped, below.
+        let accept_ranges = {
+            let mut shadows = self.shadows.lock();
+            let shadows = &mut *shadows;
+            let mut accessor = self.config_space.lock();
+            let mut mmio_just_enabled = false;
+            match HeaderType00(offset) {
+                HeaderType00::STATUS_COMMAND => {
+                    let new_command = Command::from(value as u16);
+                    if new_command.mmio_enabled() && !shadows.command.mmio_enabled() {
+                        // Flush the BAR shadow to the device.
+                        for (i, &bar) in shadows.bars.iter().enumerate() {
+                            let bar_offset = HeaderType00::BAR0.0 + (i as u16 * 4);
+                            accessor.write(self.dev.id, bar_offset, bar);
+                        }
+                        mmio_just_enabled = true;
+                    }
+                    shadows.command = new_command;
+                }
+                HeaderType00::BAR0
+                | HeaderType00::BAR1
+                | HeaderType00::BAR2
+                | HeaderType00::BAR3
+                | HeaderType00::BAR4
+                | HeaderType00::BAR5 => {
+                    // Write the BAR shadow. Defer writing to the device until MMIO
+                    // is enabled to avoid wasting time writing probe values to the
+                    // host.
+                    let i = (offset - HeaderType00::BAR0.0) as usize / 4;
+                    shadows.bars[i] = value & self.bar_masks[i] | self.bar_rao[i];
+                    return;
+                }
+                _ => {}
+            }
+            // This write enables MMIO decode (host maps the BARs); it must land
+            // before the accept below.
+            accessor.write(self.dev.id, offset, value);
+
+            if mmio_just_enabled && self.mmio_accept.is_some() {
+                let bars = shadows.bars;
+                // Skip unprogrammed BARs (base 0) so we never accept low guest RAM.
+                let mut ranges = Vec::new();
+                for bar in BarMappings::parse(&bars, &self.bar_masks).iter() {
+                    if bar.base_address != 0 {
+                        ranges.push((bar.base_address, bar.len));
                     }
                 }
-                shadows.command = new_command;
+                Some(ranges)
+            } else {
+                None
             }
-            HeaderType00::BAR0
-            | HeaderType00::BAR1
-            | HeaderType00::BAR2
-            | HeaderType00::BAR3
-            | HeaderType00::BAR4
-            | HeaderType00::BAR5 => {
-                // Write the BAR shadow. Defer writing to the device until MMIO
-                // is enabled to avoid wasting time writing probe values to the
-                // host.
-                let i = (offset - HeaderType00::BAR0.0) as usize / 4;
-                shadows.bars[i] = value & self.bar_masks[i] | self.bar_rao[i];
-                return;
+        };
+
+        // Accept synchronously before returning to the guest: a guest MMIO fault
+        // on a page being accepted (e.g. the MSI-X table in BAR0) would deadlock
+        // the host accept. Locks are dropped above so it can retry safely.
+        if let Some(ranges) = accept_ranges {
+            if let Some(mmio_accept) = &self.mmio_accept {
+                mmio_accept.accept_device_mmio(ranges);
             }
-            _ => {}
         }
-        accessor.write(self.dev.id, offset, value);
     }
 }
 

@@ -46,6 +46,7 @@ use vmcore::vm_task::VmTaskDriverSource;
 use vmcore::vpci_msi::VpciInterruptMapper;
 use vmotherboard::ChipsetDevices;
 use vmotherboard::DynamicDeviceUnit;
+pub use vpci_client::AcceptDeviceMmio;
 use vpci_client::MemoryAccess;
 use vpci_client::VpciClient;
 use vpci_client::VpciDevice;
@@ -96,6 +97,8 @@ pub struct VpciRelay {
     allowed_devices: Vec<AllowedDevice>,
     #[inspect(hex)]
     vtom: Option<u64>,
+    #[inspect(skip)]
+    mmio_accept: Option<Arc<dyn AcceptDeviceMmio>>,
     options: VpciRelayOptions,
 }
 
@@ -181,6 +184,7 @@ impl VpciRelay {
         mmio_range: MemoryRange,
         mmio_access: Box<dyn CreateMemoryAccess>,
         vtom: Option<u64>,
+        mmio_accept: Option<Arc<dyn AcceptDeviceMmio>>,
         options: VpciRelayOptions,
     ) -> Self {
         Self {
@@ -194,6 +198,7 @@ impl VpciRelay {
             mmio_access,
             allowed_devices: Vec::new(),
             vtom,
+            mmio_accept,
             options,
         }
     }
@@ -313,7 +318,7 @@ impl VpciRelay {
         tracing::info!(%instance_id, vendor_id = hw_ids.vendor_id, device_id = hw_ids.device_id, "vpci relay device arrived");
 
         let (vpci_device, removed) = vpci_device
-            .init()
+            .init(self.mmio_accept.clone())
             .await
             .context("failed to initialize vpci device")?;
         let vpci_device = Arc::new(vpci_device);
