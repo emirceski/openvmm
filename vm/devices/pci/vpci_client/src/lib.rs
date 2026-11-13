@@ -187,6 +187,14 @@ pub trait MemoryAccess: Send {
 /// The amount of MMIO space required by the VPCI bus.
 pub const MMIO_SIZE: u64 = 0x2000;
 
+/// Callback that makes a device's mapped BARs reachable from the lower VTL
+/// once the guest enables MMIO decoding. VBS-isolated guests can't reach device
+/// MMIO until VTL2 accepts it.
+///
+/// It runs before the config write that enabled decoding returns to the guest,
+/// with no config space locks held.
+pub type AcceptDeviceMmio = Arc<dyn Fn(&[ActiveMmioBar]) + Send + Sync>;
+
 /// A device description, which represents a VPCI device available on a bus.
 #[derive(Inspect)]
 pub struct VpciDeviceDescription {
@@ -221,6 +229,8 @@ pub struct VpciDevice {
     /// RAO == Read As One
     bar_rao: [u32; 6],
     tdisp: TdispClient,
+    #[inspect(skip)]
+    accept_mmio: Option<AcceptDeviceMmio>,
 }
 
 #[derive(Inspect)]
@@ -344,11 +354,15 @@ impl VpciDeviceDescription {
     /// Initializes the device, returning a VPCI device instance that can be
     /// used to interact with it. Also returns an object to use to get notified
     /// when the device is ejected or surprise removed.
+    ///
+    /// `accept_mmio`, if set, is called whenever the guest enables MMIO
+    /// decoding.
     pub async fn init(
         self,
         resource_validator: Arc<dyn TdispResourceValidationInterface>,
         isolation_type: IsolationType,
         target_vtl: hvdef::Vtl,
+        accept_mmio: Option<AcceptDeviceMmio>,
     ) -> anyhow::Result<(VpciDevice, VpciDeviceEject)> {
         let requirements = self
             .req
@@ -416,6 +430,7 @@ impl VpciDeviceDescription {
             serial_num,
             dev,
             tdisp,
+            accept_mmio,
         };
 
         Ok((device, VpciDeviceEject(eject)))
@@ -519,9 +534,10 @@ impl VpciDevice {
     /// Offset must be u32 aligned.
     pub fn write_cfg(&self, offset: u16, value: ByteEnabledDwordWrite) {
         tracing::trace!(?offset, ?value, "config space write");
-        let mut shadows = self.shadows.lock();
-        let shadows = &mut *shadows;
+        let mut shadow_lock = self.shadows.lock();
+        let shadows = &mut *shadow_lock;
         let mut accessor = self.config_space.lock();
+        let mut mmio_enabled = false;
         match HeaderType00(offset) {
             HeaderType00::STATUS_COMMAND => {
                 let new_command = Command::from(value.merge_low(shadows.command.into_bits()));
@@ -532,6 +548,7 @@ impl VpciDevice {
                         let write_dword = ByteEnabledDwordWrite::with_all_bytes_enabled(bar);
                         accessor.write(self.dev.id, bar_offset, write_dword);
                     }
+                    mmio_enabled = true;
                 }
                 shadows.command = new_command;
             }
@@ -552,6 +569,12 @@ impl VpciDevice {
             _ => {}
         }
         accessor.write(self.dev.id, offset, value);
+        // The host maps the BARs when it sees the write above.
+        if let Some(accept_mmio) = self.accept_mmio.as_ref().filter(|_| mmio_enabled) {
+            let bars = active_mmio_bars(&shadows.bars, &self.bar_masks);
+            drop((accessor, shadow_lock));
+            accept_mmio(&bars);
+        }
     }
 
     /// Clear the MMIO-enable and bus-master bits in both the shadowed command
@@ -1406,7 +1429,7 @@ fn tx_id_to_index(tx_id: u64) -> usize {
 /// One MMIO range the guest has programmed into a BAR, decoded from the
 /// shadowed BAR values and the masks the device reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ActiveMmioBar {
+pub struct ActiveMmioBar {
     /// The BAR index. For a 64-bit BAR this is the lower half, which is the
     /// index the TDI interface report uses for the pair.
     pub bar_id: u16,

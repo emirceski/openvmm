@@ -767,6 +767,7 @@ open_enum! {
         HvCallPinGpaPageRanges = 0x0112,
         HvCallUnpinGpaPageRanges = 0x0113,
         HvCallQuerySparseGpaPageHostVisibility = 0x011C,
+        HvCallSetLogicalDeviceProperty = 0x0128,
 
         // Extended hypercalls.
         HvExtCallQueryCapabilities = 0x8001,
@@ -1520,6 +1521,46 @@ pub mod hypercall {
         pub rsvd: u64,
         pub target_header: InterruptTarget,
     }
+
+    open_enum::open_enum! {
+        /// Logical device property codes for
+        /// [`HypercallCode::HvCallSetLogicalDeviceProperty`].
+        #[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+        pub enum HvLogicalDevicePropertyCode: u32 {
+            #![expect(non_upper_case_globals)]
+            /// Authorizes the device's DMA and interrupts on a VBS-isolated
+            /// partition. The value is a [`LogicalDevicePropertyIoAuthorized`].
+            HvLogicalDevicePropertyIoAuthorized = 12,
+        }
+    }
+
+    /// Input for [`HypercallCode::HvCallSetLogicalDeviceProperty`]
+    /// (`HV_INPUT_SET_LOGICAL_DEVICE_PROPERTY`).
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
+    pub struct SetLogicalDeviceProperty {
+        pub partition_id: u64,
+        pub logical_device_id: u64,
+        pub property_code: HvLogicalDevicePropertyCode,
+        pub reserved: u32,
+        /// The property's value, zero-padded.
+        pub property_value: [u8; 32],
+    }
+    const_assert!(size_of::<SetLogicalDeviceProperty>() == 0x38);
+
+    /// Value of
+    /// [`HvLogicalDevicePropertyCode::HvLogicalDevicePropertyIoAuthorized`]
+    /// (`HV_LOGICAL_DEVICE_PROPERTY_IO_AUTHORIZED`).
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
+    pub struct LogicalDevicePropertyIoAuthorized {
+        /// Must be 1: the hypervisor can't deauthorize a device yet.
+        pub authorized: u8,
+        pub reserved0: u8,
+        pub reserved1: u16,
+        pub reserved2: u32,
+    }
+    const_assert!(size_of::<LogicalDevicePropertyIoAuthorized>() == 8);
 
     #[bitfield(u8)]
     #[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]

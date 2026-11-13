@@ -245,6 +245,7 @@ async fn connect_relay_with(
             Arc::new(TdispNoopResourceValidator::new()),
             IsolationType::Snp,
             Vtl::Vtl0,
+            None,
         )
         .await
         .unwrap();
@@ -548,4 +549,12 @@ async fn downlevel_host_never_sees_tdisp_commands(driver: DefaultDriver) {
 
     assert_eq!(t.relay.lock().tdisp_operations.get(), 0);
     assert_eq!(t.device.tdisp().tdi_state().await, TdispTdiState::Unlocked);
+}
+
+/// The ID is bytes 4-7 of the bus's instance ID, as the guest's VPCI driver
+/// derives it, with the function bits cleared.
+#[test]
+fn logical_device_id_clears_the_function_bits() {
+    let instance_id = guid::guid!("1d647a44-ac3d-4077-bf1b-32e52078a102");
+    assert_eq!(super::logical_device_id(&instance_id), 0xac3d_4070);
 }

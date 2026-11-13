@@ -21,6 +21,10 @@ pub use pci_core::spec::hwid::ClassCode;
 pub use pci_core::spec::hwid::ProgrammingInterface;
 pub use pci_core::spec::hwid::Subclass;
 
+// Exported for implementing the device hooks passed to `VpciRelay::new`.
+pub use vpci_client::AcceptDeviceMmio;
+pub use vpci_client::ActiveMmioBar;
+
 use anyhow::Context as _;
 use chipset_device::ChipsetDevice;
 use chipset_device::io::IoResult;
@@ -96,6 +100,17 @@ pub struct VpciRelayOptions {
     pub test_tdisp_flow: bool,
 }
 
+/// Callback that authorizes a device's DMA and interrupts, given the
+/// hypervisor's logical ID for it. Called before the device is offered to the
+/// guest.
+pub type AuthorizeDeviceIo = Arc<dyn Fn(u64) + Send + Sync>;
+
+/// The hypervisor's logical ID for function 0 on a VPCI bus. The guest's VPCI
+/// driver derives it the same way from the bus's instance ID.
+fn logical_device_id(instance_id: &Guid) -> u64 {
+    u64::from(instance_id.data2) << 16 | u64::from(instance_id.data3 & 0xfff8)
+}
+
 /// Virtual PCI relay.
 #[derive(Inspect)]
 pub struct VpciRelay {
@@ -118,6 +133,10 @@ pub struct VpciRelay {
     #[inspect(hex)]
     vtom: Option<u64>,
     isolation_type: IsolationType,
+    #[inspect(skip)]
+    authorize_device_io: Option<AuthorizeDeviceIo>,
+    #[inspect(skip)]
+    accept_device_mmio: Option<AcceptDeviceMmio>,
     options: VpciRelayOptions,
     /// Base of the window the mocked TDISP flow programs into a device BAR,
     /// carved out of `mmio_range` and never handed to a device's config space.
@@ -249,6 +268,8 @@ impl VpciRelay {
         mmio_access: Box<dyn CreateMemoryAccess>,
         isolation_type: IsolationType,
         vtom: Option<u64>,
+        authorize_device_io: Option<AuthorizeDeviceIo>,
+        accept_device_mmio: Option<AcceptDeviceMmio>,
         options: VpciRelayOptions,
     ) -> Self {
         // Setup test-specific values since TDISP tests don't necessarily take place inside a CVM runner.
@@ -295,6 +316,8 @@ impl VpciRelay {
             allowed_devices: Vec::new(),
             vtom: target_vtom,
             isolation_type: target_isolation_type,
+            authorize_device_io,
+            accept_device_mmio,
             options,
             mock_bar_mmio,
         }
@@ -439,10 +462,19 @@ impl VpciRelay {
                 .context("failed to create a TDISP resource validator")?;
 
         let (vpci_device, removed) = vpci_device
-            .init(resource_validator, self.isolation_type, hvdef::Vtl::Vtl0)
+            .init(
+                resource_validator,
+                self.isolation_type,
+                hvdef::Vtl::Vtl0,
+                self.accept_device_mmio.clone(),
+            )
             .await
             .context("failed to initialize vpci device")?;
         let vpci_device = Arc::new(vpci_device);
+
+        if let Some(authorize) = &self.authorize_device_io {
+            authorize(logical_device_id(&instance_id));
+        }
 
         let tdisp_operations = TdispOperationCount::default();
 

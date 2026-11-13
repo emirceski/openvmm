@@ -5,6 +5,9 @@
 
 #![cfg(test)]
 
+use super::AcceptDeviceMmio;
+use super::ActiveMmioBar;
+use super::VpciDevice;
 use chipset_device::ChipsetDevice;
 use chipset_device::io::IoResult;
 use chipset_device::mmio::ExternallyManagedMmioIntercepts;
@@ -19,7 +22,12 @@ use openhcl_tdisp::noop::TdispNoopResourceValidator;
 use pal_async::DefaultDriver;
 use pal_async::async_test;
 use pal_async::task::Spawn;
+use parking_lot::Mutex;
+use pci_core::spec::cfg_space::Command;
+use pci_core::spec::cfg_space::HeaderType00;
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::Weak;
 use task_control::StopTask;
 use tdisp::TdispHostDeviceTargetEmulator;
 use tdisp::test_helpers::TDISP_MOCK_DEVICE_ID;
@@ -137,6 +145,7 @@ async fn test_negotiate_version(driver: DefaultDriver) {
             Arc::new(TdispNoopResourceValidator::new()),
             IsolationType::None,
             Vtl::Vtl0,
+            None,
         )
         .await
         .unwrap();
@@ -208,6 +217,7 @@ async fn test_tdisp_interface_get_device_interface_info(driver: DefaultDriver) {
             Arc::new(TdispNoopResourceValidator::new()),
             IsolationType::None,
             Vtl::Vtl0,
+            None,
         )
         .await
         .unwrap();
@@ -227,6 +237,127 @@ async fn test_tdisp_interface_get_device_interface_info(driver: DefaultDriver) {
         }
         Err(err) => panic!("unexpected error: {err}"),
     }
+}
+
+/// A device with one 64 KiB, 64-bit memory BAR in slots 0 and 1.
+struct BarDevice {
+    tdisp_interface: TdispHostDeviceTargetEmulator,
+    bars: [u32; 2],
+}
+
+impl ChipsetDevice for BarDevice {
+    fn supports_pci(&mut self) -> Option<&mut dyn PciConfigSpace> {
+        Some(self)
+    }
+
+    fn supports_tdisp_host(&mut self) -> Option<&mut dyn tdisp::TdispHostDeviceTarget> {
+        Some(&mut self.tdisp_interface)
+    }
+}
+
+impl PciConfigSpace for BarDevice {
+    fn pci_cfg_read(&mut self, offset: u16, mut value: ByteEnabledDwordRead<'_>) -> IoResult {
+        value.set(match HeaderType00(offset) {
+            HeaderType00::BAR0 => self.bars[0],
+            HeaderType00::BAR1 => self.bars[1],
+            _ => 0,
+        });
+        IoResult::Ok
+    }
+
+    fn pci_cfg_write(&mut self, offset: u16, value: ByteEnabledDwordWrite) -> IoResult {
+        match HeaderType00(offset) {
+            // The low bits are read-only and mark a 64-bit memory BAR.
+            HeaderType00::BAR0 => self.bars[0] = value.merge(self.bars[0]) & !0xffff | 0b100,
+            HeaderType00::BAR1 => self.bars[1] = value.merge(self.bars[1]),
+            _ => {}
+        }
+        IoResult::Ok
+    }
+}
+
+/// The BAR hook gets the mapped BARs each time the guest turns MMIO decoding
+/// on, and runs while other config space accesses can still get through.
+#[async_test]
+async fn accept_mmio_runs_when_mmio_decoding_turns_on(driver: DefaultDriver) {
+    let device = Arc::new(CloseableMutex::new(BarDevice {
+        tdisp_interface: new_null_tdisp_interface("vpci-unit-test"),
+        bars: [0; 2],
+    }));
+    let (bus, mut channel) = VpciBusDevice::new(
+        VpciBusConfig {
+            instance_id: Guid::new_random(),
+            vtom: None,
+            vnode: None,
+        },
+        device,
+        &mut ExternallyManagedMmioIntercepts,
+        VpciInterruptMapper::new(TestVpciInterruptController::new()),
+    )
+    .unwrap();
+
+    let (host, guest) = vmbus_channel::connected_async_channels(32768);
+    let mut runner = channel.open(host, GuestMemory::empty()).unwrap();
+    let _task = driver.spawn("server", async move {
+        StopTask::run_unstoppable(async |stop| {
+            let _ = channel.run(stop, &mut runner).await;
+        })
+        .await
+    });
+
+    let (_client, devices) =
+        super::VpciClient::connect(&driver, guest, Box::new(BusWrapper(bus)), mesh::channel().0)
+            .await
+            .unwrap();
+
+    let accepted = Arc::new(Mutex::new(Vec::new()));
+    let this = Arc::new(OnceLock::<Weak<VpciDevice>>::new());
+    let accept: AcceptDeviceMmio = Arc::new({
+        let accepted = accepted.clone();
+        let this = this.clone();
+        move |bars: &[ActiveMmioBar]| {
+            let device = this.get().and_then(Weak::upgrade).unwrap();
+            assert!(device.shadows.try_lock().is_some());
+            assert!(device.config_space.try_lock().is_some());
+            accepted.lock().push(bars.to_vec());
+        }
+    });
+
+    let (device, _removed) = devices
+        .into_iter()
+        .next()
+        .unwrap()
+        .init(
+            Arc::new(TdispNoopResourceValidator::new()),
+            IsolationType::None,
+            Vtl::Vtl0,
+            Some(accept),
+        )
+        .await
+        .unwrap();
+    let device = Arc::new(device);
+    this.set(Arc::downgrade(&device)).unwrap();
+
+    let write = |offset: HeaderType00, value: u32| {
+        device.write_cfg(
+            offset.0,
+            ByteEnabledDwordWrite::with_all_bytes_enabled(value),
+        )
+    };
+    let mmio_on = u32::from(u16::from(Command::new().with_mmio_enabled(true)));
+    write(HeaderType00::BAR0, 0x1000_0000);
+    write(HeaderType00::BAR1, 0x1);
+    write(HeaderType00::STATUS_COMMAND, mmio_on);
+    write(HeaderType00::STATUS_COMMAND, mmio_on);
+    write(HeaderType00::STATUS_COMMAND, 0);
+    write(HeaderType00::STATUS_COMMAND, mmio_on);
+
+    let bar = ActiveMmioBar {
+        bar_id: 0,
+        base_address: 0x1_1000_0000,
+        length_bytes: 0x10000,
+    };
+    assert_eq!(*accepted.lock(), [vec![bar], vec![bar]]);
 }
 
 mod active_mmio_bars {

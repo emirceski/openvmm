@@ -1365,6 +1365,98 @@ fn resolve_vpci_relay(
     Ok(wanted && mmio_window_available)
 }
 
+/// On VBS the hypervisor denies a relayed device's DMA and interrupts until
+/// VTL2 authorizes it. Hypervisors without this support leave the device
+/// unusable, so failures are only logged.
+fn vbs_authorize_device_io() -> anyhow::Result<vpci_relay::AuthorizeDeviceIo> {
+    let hvcall = hcl::ioctl::MshvHvcall::new()
+        .context("failed to open mshv_hvcall for device I/O authorization")?;
+    hvcall.set_allowed_hypercalls(&[hvdef::HypercallCode::HvCallSetLogicalDeviceProperty]);
+    Ok(Arc::new(move |logical_device_id: u64| {
+        match hvcall.authorize_device_io(logical_device_id) {
+            Ok(()) => tracing::info!(
+                CVM_ALLOWED,
+                logical_device_id = format_args!("{logical_device_id:#x}"),
+                "authorized device I/O"
+            ),
+            Err(err) => tracelimit::warn_ratelimited!(
+                CVM_ALLOWED,
+                logical_device_id = format_args!("{logical_device_id:#x}"),
+                error = &err as &dyn std::error::Error,
+                "failed to authorize device I/O"
+            ),
+        }
+    }))
+}
+
+/// On VBS the lower VTL can't reach a relayed device's BARs until VTL2 accepts
+/// them, each time the guest enables MMIO decoding. The guest chooses the BAR
+/// addresses, so only BARs inside `vtl0_mmio` are accepted.
+fn vbs_accept_device_mmio(
+    vtl0_mmio: Vec<MemoryRange>,
+) -> anyhow::Result<vpci_relay::AcceptDeviceMmio> {
+    let hvcall = hcl::ioctl::MshvHvcall::new()
+        .context("failed to open mshv_hvcall for device MMIO acceptance")?;
+    hvcall.set_allowed_hypercalls(&[hvdef::HypercallCode::HvCallAcceptGpaPages]);
+    Ok(Arc::new(move |bars: &[vpci_relay::ActiveMmioBar]| {
+        for &vpci_relay::ActiveMmioBar {
+            bar_id,
+            base_address: base,
+            length_bytes: len,
+        } in bars
+        {
+            let inside = base.checked_add(len).is_some_and(|end| {
+                vtl0_mmio
+                    .iter()
+                    .any(|r| r.start() <= base && end <= r.end())
+            });
+            if !inside {
+                tracelimit::warn_ratelimited!(
+                    CVM_ALLOWED,
+                    bar_id,
+                    base = format_args!("{base:#x}"),
+                    len = format_args!("{len:#x}"),
+                    "device BAR is outside VTL0 MMIO, not accepting it"
+                );
+                continue;
+            }
+            let range = MemoryRange::bounding(base..base + len);
+            // The host maps the BARs shortly after it sees the guest's command
+            // write, so retry briefly while the pages aren't present yet.
+            let mut attempt = 1;
+            loop {
+                match hvcall.accept_gpa_pages(
+                    range,
+                    hvdef::hypercall::AcceptMemoryType::ANY,
+                    hvdef::hypercall::HostVisibilityType::SHARED,
+                ) {
+                    Ok(()) => {
+                        tracing::info!(CVM_ALLOWED, bar_id, %range, attempt, "accepted device BAR");
+                        break;
+                    }
+                    Err(hcl::ioctl::AcceptPagesError::Hypervisor { hv_error, .. })
+                        if hv_error == hvdef::HvError::OperationDenied && attempt < 5 =>
+                    {
+                        std::thread::sleep(Duration::from_millis(20));
+                        attempt += 1;
+                    }
+                    Err(err) => {
+                        tracelimit::error_ratelimited!(
+                            CVM_ALLOWED,
+                            bar_id,
+                            %range,
+                            attempt,
+                            error = &err as &dyn std::error::Error,
+                            "failed to accept device BAR"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }))
+}
+
 #[cfg(guest_arch = "x86_64")]
 fn new_x86_topology(
     cpus: &[bootloader_fdt_parser::Cpu],
@@ -3562,6 +3654,7 @@ async fn new_underhill_vm(
 
                 use vpci_relay::*;
 
+                let vbs = isolation == virt::IsolationType::Vbs;
                 let mut relay = VpciRelay::new(
                     driver_source.clone(),
                     vpci_filter.take(),
@@ -3590,6 +3683,9 @@ async fn new_underhill_vm(
                     },
                     isolation,
                     vtom,
+                    vbs.then(vbs_authorize_device_io).transpose()?,
+                    vbs.then(|| vbs_accept_device_mmio(vec![chipset_mmio.low, chipset_mmio.high]))
+                        .transpose()?,
                     VpciRelayOptions {
                         // Exercises a mocked TDISP flow for emulated TDISP devices produced by OpenVMM tests.
                         test_tdisp_flow,
